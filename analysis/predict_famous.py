@@ -1,282 +1,216 @@
+#!/usr/bin/env python3
 """
-predict_famous.py
-=================
-Extracts PLM-MCNN predictions for the 8 canonical oncogenic KRAS mutations:
-  G12D, G12V, G12R, G12C, G13D, Q61H, Q61L, Q61R
+Predictions and classification accuracy for 8 canonical oncogenic KRAS mutations.
+All positions are in test_curated — held out from training.
 
-All 8 are in test_curated (biological challenge set) — the model never saw
-these positions during training. Compares model predictions to experimental
-ΔΔG values and clinical expectations.
-
-Run:
-  python predict_famous.py \
-    --tensor_dir /srv/jupyterlab/workspace/KRAS/tensors/ \
-    --master_csv /srv/jupyterlab/workspace/KRAS/data/kras_master_table.csv \
-    --model_pt   /srv/jupyterlab/workspace/KRAS/code/results/mcnn_k1_4_8_16_p256_f256.pt \
-    --output     /srv/jupyterlab/workspace/KRAS/code/results/
+Usage:
+    python predict_famous.py \
+        --tensor_dir tensors/ \
+        --master_csv data/kras_master_table.csv \
+        --model_pt   results/MCNN_seed1.pt \
+        --output     results/
 """
 
-import os, argparse, logging
+import os
+import argparse
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
+
+from dataset import KRASRegressionDataset, compute_target_stats, TARGET_NAMES, N_TARGETS
+
 warnings.filterwarnings("ignore")
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-
-from dataset import (
-    KRASRegressionDataset, compute_target_stats,
-    TARGET_NAMES, N_TARGETS, SPLIT_PARTITIONS, MASK_COLS,
-)
-
-# ── args ──────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser()
-parser.add_argument("--tensor_dir", required=True)
-parser.add_argument("--master_csv", required=True)
-parser.add_argument("--model_pt",   required=True,
-                    help="Path to saved model .pt file")
-parser.add_argument("--output",     required=True)
-args = parser.parse_args()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.info(f"Device: {device}")
-
-# ── famous mutations ───────────────────────────────────────────────────────────
-FAMOUS = {
-    'G12D': {'position': 12, 'wt': 'G', 'mut': 'D'},
-    'G12V': {'position': 12, 'wt': 'G', 'mut': 'V'},
-    'G12R': {'position': 12, 'wt': 'G', 'mut': 'R'},
-    'G12C': {'position': 12, 'wt': 'G', 'mut': 'C'},
-    'G13D': {'position': 13, 'wt': 'G', 'mut': 'D'},
-    'Q61H': {'position': 61, 'wt': 'Q', 'mut': 'H'},
-    'Q61L': {'position': 61, 'wt': 'Q', 'mut': 'L'},
-    'Q61R': {'position': 61, 'wt': 'Q', 'mut': 'R'},
-}
-
-# ── clinical context (from literature) ────────────────────────────────────────
-CLINICAL = {
-    'G12D': 'Most common KRAS mutation; impairs GTP hydrolysis; near-neutral binding profile',
-    'G12V': 'Strong GTPase impairment; broad effector engagement; activating',
-    'G12R': 'Specificity modulator; SOS1 exchange strongly impaired; effector-selective',
-    'G12C': 'Covalent inhibitor target (sotorasib, adagrasib); SOS1 partially impaired',
-    'G13D': 'Near-neutral across partners; GEF exchange partially retained',
-    'Q61H': 'Moderate GTPase impairment; near-neutral binding profile',
-    'Q61L': 'Strong activating; SOS1 weakened; conformation-selective',
-    'Q61R': 'Strong activating; SOS1 strongly weakened; K27 conformation shift',
-}
 
 DDG_DELTA = 0.25
 
-def classify(ddg):
-    if np.isnan(ddg): return 'NaN'
-    if ddg < -DDG_DELTA: return 'Enhanced'
-    if ddg >  DDG_DELTA: return 'Weakened'
-    return 'Neutral'
+FAMOUS = {
+    "G12D": (12, "G", "D"),
+    "G12V": (12, "G", "V"),
+    "G12R": (12, "G", "R"),
+    "G12C": (12, "G", "C"),
+    "G13D": (13, "G", "D"),
+    "Q61H": (61, "Q", "H"),
+    "Q61L": (61, "Q", "L"),
+    "Q61R": (61, "Q", "R"),
+}
+
+CLINICAL = {
+    "G12D": "impairs GAP hydrolysis; near-neutral effector binding (Fell et al. 2020)",
+    "G12V": "strong GTPase impairment; broad effector engagement",
+    "G12R": "SOS1 exchange strongly impaired; effector-selective (Golan et al. 2026)",
+    "G12C": "covalent inhibitor target (sotorasib, adagrasib); SOS1 partially impaired",
+    "G13D": "near-neutral across partners; GEF exchange partially retained",
+    "Q61H": "moderate GTPase impairment; near-neutral binding profile",
+    "Q61L": "strong activating; SOS1 weakened; conformation-selective",
+    "Q61R": "strong activating; SOS1 strongly weakened; K27 conformation shift (Lu et al. 2016)",
+}
 
 
-# ── reconstruct model architecture (must match training) ─────────────────────
+def classify(v):
+    if np.isnan(v):    return "NaN"
+    if v < -DDG_DELTA: return "Enhanced"
+    if v >  DDG_DELTA: return "Weakened"
+    return "Neutral"
+
+
 class MutationCenteredPool(nn.Module):
-    def __init__(self, half_win=5):
+    def __init__(self, hw=5):
         super().__init__()
-        self.half_win = half_win
+        self.hw = hw
 
-    def forward(self, conv_out, mask_ch):
-        B, F, L = conv_out.shape
-        if mask_ch is None:
-            pos = L // 2
-            lo  = max(0, pos - self.half_win)
-            hi  = min(L, pos + self.half_win + 1)
-            return conv_out[:, :, lo:hi].mean(dim=-1)
-        out = torch.zeros(B, F, device=conv_out.device)
+    def forward(self, x, mask):
+        B, F, L = x.shape
+        out = torch.zeros(B, F, device=x.device)
         for b in range(B):
-            pos = int(mask_ch[b].argmax().item())
-            lo  = max(0, pos - self.half_win)
-            hi  = min(L, pos + self.half_win + 1)
-            out[b] = conv_out[b, :, lo:hi].mean(dim=-1)
+            pos = mask[b].argmax().item() if mask is not None else L // 2
+            lo, hi = max(0, pos - self.hw), min(L, pos + self.hw + 1)
+            out[b] = x[b, :, lo:hi].mean(-1)
         return out
 
 
 class KRAS_MCNN(nn.Module):
-    def __init__(self, n_channels=5, emb_dim=1280, proj_dim=256,
-                 kernels=None, n_filters=256, local_win=5,
-                 dropout=0.30, n_targets=N_TARGETS):
+    def __init__(self, n_ch=5, proj=256, filters=256,
+                 kernels=None, win=5, drop=0.30, n_out=N_TARGETS):
         super().__init__()
-        if kernels is None: kernels = [1,4,8,16]
-        self.kernels  = kernels
-        self.proj_dim = proj_dim
-        self.n_ch     = n_channels
-
-        self.projection = nn.Linear(emb_dim, proj_dim, bias=False)
-        in_channels     = n_channels * proj_dim
-
-        self.conv_branches = nn.ModuleList()
-        for k in kernels:
-            self.conv_branches.append(nn.Sequential(
-                nn.Conv1d(in_channels, n_filters, kernel_size=k, padding=k//2),
-                nn.GELU(),
-            ))
-
-        self.mut_pool  = MutationCenteredPool(half_win=local_win)
-        branch_dim     = n_filters * 3
-        concat_dim     = branch_dim * len(kernels)
-
+        kernels = kernels or [1, 4, 8, 16]
+        self.n_ch, self.proj = n_ch, proj
+        self.projection    = nn.Linear(1280, proj, bias=False)
+        self.conv_branches = nn.ModuleList([
+            nn.Sequential(nn.Conv1d(proj * n_ch, filters, k, padding=k // 2))
+            for k in kernels
+        ])
+        self.mut_pool = MutationCenteredPool(win)
         self.trunk = nn.Sequential(
-            nn.Linear(concat_dim, 512), nn.GELU(), nn.LayerNorm(512),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(filters * 3 * len(kernels), 512),
+            nn.GELU(), nn.LayerNorm(512), nn.Dropout(drop),
+            nn.Linear(512, 256),
         )
-        self.heads = nn.ModuleList([nn.Linear(256, 1) for _ in range(n_targets)])
+        self.heads = nn.ModuleList([nn.Linear(256, 1) for _ in range(n_out)])
 
-    def forward(self, x_full):
-        B, _, L, D = x_full.shape
-        # select channels to match n_channels from checkpoint
-        if self.n_ch == 4:
-            ch_idx = [0,1,2,3]   # A4: no mask channel
-        else:
-            ch_idx = [0,1,2,3,4] # full model: all 5 channels
-        x        = x_full[:, ch_idx, :, :]
-        mask_ch  = x_full[:, 4, :, 0] if self.n_ch == 5 else None
-        x_proj   = self.projection(x)
-        x_flat   = x_proj.permute(0,1,3,2)
-        x_flat   = x_flat.reshape(B, self.n_ch * self.proj_dim, L)
-
-        branch_outs = []
+    def forward(self, x):
+        B, C, L, _ = x.shape
+        h    = self.projection(x).permute(0, 1, 3, 2).reshape(B, C * self.proj, L)
+        mask = x[:, 4, :, 0] if self.n_ch == 5 else None
+        outs = []
         for conv in self.conv_branches:
-            feat = conv(x_flat)
-            if feat.shape[2] != L: feat = feat[:,:,:L]
-            g_max  = feat.max(dim=2).values
-            g_mean = feat.mean(dim=2)
-            m_pool = self.mut_pool(feat, mask_ch)
-            branch_outs.append(torch.cat([g_max, g_mean, m_pool], dim=1))
+            c = F.gelu(conv(h))
+            if c.shape[-1] != L:
+                c = c[:, :, :L] if c.shape[-1] > L else F.pad(c, (0, L - c.shape[-1]))
+            outs.append(torch.cat([c.max(-1).values, c.mean(-1),
+                                   self.mut_pool(c, mask)], dim=1))
+        h = self.trunk(torch.cat(outs, 1))
+        return torch.stack([head(h).squeeze(1) for head in self.heads], dim=1)
 
-        h     = torch.cat(branch_outs, dim=1)
-        h     = self.trunk(h)
-        preds = torch.cat([head(h) for head in self.heads], dim=1)
-        return preds
+
+def load_model(pt_path, device):
+    state = torch.load(pt_path, map_location=device)
+    # infer architecture from checkpoint weight shapes
+    proj_dim = state["projection.weight"].shape[0]
+    conv_in  = state["conv_branches.0.0.weight"].shape[1]
+    n_ch     = conv_in // proj_dim
+    print(f"  checkpoint: n_channels={n_ch}, proj_dim={proj_dim}")
+    model = KRAS_MCNN(n_ch=n_ch, proj=proj_dim)
+    model.load_state_dict(state)
+    return model.to(device).eval()
 
 
 def main():
-    print("=" * 70)
-    print("Famous Mutation Analysis — KRAS PLM-MCNN")
-    print("=" * 70)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tensor_dir", required=True)
+    parser.add_argument("--master_csv", required=True)
+    parser.add_argument("--model_pt",   required=True)
+    parser.add_argument("--output",     required=True)
+    args = parser.parse_args()
 
-    # ── load master table ──────────────────────────────────────────────────────
+    os.makedirs(args.output, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     master = pd.read_csv(args.master_csv)
 
-    # ── normalisation stats ────────────────────────────────────────────────────
     train_ds = KRASRegressionDataset(
-        split='train', tensor_dir=args.tensor_dir, master_csv=args.master_csv)
+        split="train", tensor_dir=args.tensor_dir,
+        master_csv=args.master_csv, min_observed=1,
+    )
     means, stds = compute_target_stats(train_ds)
 
-    # ── find famous mutations ─────────────────────────────────────────────────
-    results = []
-    for name, info in FAMOUS.items():
-        row = master[
-            (master['position'] == info['position']) &
-            (master['mutant_aa'] == info['mut'])
-        ]
-        if len(row) == 0:
-            logging.warning(f"  {name} not found in master table")
+    print(f"{'[train]':10} {len(train_ds)} variants")
+    for t in TARGET_NAMES:
+        print(f"  {t:<10} N={train_ds.targets_raw[t].notna().sum():<6} "
+              f"mean={means[t]:.4f}  std={stds[t]:.4f}")
+
+    found = []
+    for name, (pos, wt, mut) in FAMOUS.items():
+        row = master[(master["position"] == pos) & (master["mutant_aa"] == mut)]
+        if row.empty:
+            print(f"  {name}: not found")
             continue
         row = row.iloc[0]
-        logging.info(f"  {name}: variant={row['variant']}  partition={row['partition']}")
-        results.append({'name': name, 'variant': row['variant'],
-                        'position': row['position'], 'mut': info['mut'],
-                        'partition': row['partition'], 'row': row})
+        print(f"  {name}: variant={row['variant']}  partition={row['partition']}")
+        found.append((name, row))
 
-    # ── load model ─────────────────────────────────────────────────────────────
-    # detect n_channels from checkpoint to handle any saved model
-    state       = torch.load(args.model_pt, map_location=device)
-    conv_weight = state.get('conv_branches.0.0.weight', None)
-    proj_weight = state.get('projection.weight', None)
-    if conv_weight is not None and proj_weight is not None:
-        proj_dim   = proj_weight.shape[0]      # e.g. 256
-        conv_in    = conv_weight.shape[1]      # e.g. 1024 or 1280
-        n_channels = conv_in // proj_dim       # 4 or 5
-        logging.info(f"Detected n_channels={n_channels} proj_dim={proj_dim} from checkpoint")
-    else:
-        n_channels = 5
-        proj_dim   = 256
-        logging.warning("Could not detect channels from checkpoint — assuming 5")
+    print(f"\nloading {args.model_pt}")
+    model = load_model(args.model_pt, device)
 
-    model = KRAS_MCNN(n_channels=n_channels, proj_dim=proj_dim).to(device)
-    model.load_state_dict(state, strict=True)
-    model.eval()
-    logging.info(f"Model loaded: {args.model_pt}")
+    tensor_dir_bio = os.path.join(args.tensor_dir, "test_bio")
+    rows = []
 
-    # ── predict ────────────────────────────────────────────────────────────────
-    TENSOR_DIR_BIO = os.path.join(args.tensor_dir, 'test_bio')
+    print(f"\n{'Mutation':<8} {'Target':<10} {'Experimental':>13} "
+          f"{'Predicted':>11} {'Exp':>10} {'Pred':>10} {'Match'}")
+    print("-" * 70)
 
-    print(f"\n{'Mutation':<8} {'Target':<10} {'Experimental':>13} {'Predicted':>11} {'Exp class':<11} {'Pred class':<11} {'Match'}")
-    print("-" * 75)
-
-    all_rows = []
-    for entry in results:
-        name    = entry['name']
-        variant = entry['variant']
-        row     = entry['row']
-
-        # load tensor
-        tpath = os.path.join(TENSOR_DIR_BIO, variant + '.npy')
+    for name, row in found:
+        variant = row["variant"]
+        tpath   = os.path.join(tensor_dir_bio, variant + ".npy")
         if not os.path.exists(tpath):
-            logging.warning(f"  Tensor not found: {tpath}")
+            print(f"  tensor missing: {tpath}")
             continue
 
-        tensor = torch.from_numpy(np.load(tpath)).unsqueeze(0).to(device)  # (1,5,188,1280)
-
+        Z = torch.from_numpy(np.load(tpath)).unsqueeze(0).to(device)
         with torch.no_grad():
-            pred_norm = model(tensor).cpu().numpy()[0]   # (7,)
+            pred_norm = model(Z).cpu().numpy()[0]
 
-        # denormalise
         pred_raw = np.array([
-            pred_norm[j] * stds[t] + means[t]
-            if stds[t] > 1e-6 else pred_norm[j]
+            pred_norm[j] * stds[t] + means[t] if stds[t] > 1e-6 else pred_norm[j]
             for j, t in enumerate(TARGET_NAMES)
         ])
 
         for j, t in enumerate(TARGET_NAMES):
-            exp_val  = float(row.get(f'ddG_{t}', np.nan))
-            pred_val = float(pred_raw[j])
-            exp_cls  = classify(exp_val)
-            pred_cls = classify(pred_val)
-            match    = '✓' if exp_cls == pred_cls else '✗'
-
-            if not np.isnan(exp_val):
-                print(f"  {name:<8} {t:<10} {exp_val:>13.3f} {pred_val:>11.3f} "
-                      f"{exp_cls:<11} {pred_cls:<11} {match}")
-
-            all_rows.append({
-                'Mutation': name, 'Target': t,
-                'Exp_ddG':  round(exp_val,  4) if not np.isnan(exp_val) else np.nan,
-                'Pred_ddG': round(pred_val, 4),
-                'Exp_class':  exp_cls,
-                'Pred_class': pred_cls,
-                'Class_match': exp_cls == pred_cls,
-                'Clinical':   CLINICAL[name],
+            exp  = float(row.get(f"ddG_{t}", np.nan))
+            pred = float(pred_raw[j])
+            ec, pc = classify(exp), classify(pred)
+            match  = "✓" if ec == pc else "✗"
+            if not np.isnan(exp):
+                print(f"  {name:<8} {t:<10} {exp:>13.3f} {pred:>11.3f} "
+                      f"{ec:>10} {pc:>10} {match}")
+            rows.append({
+                "Mutation": name, "Target": t,
+                "Exp_ddG": round(exp, 4) if not np.isnan(exp) else np.nan,
+                "Pred_ddG": round(pred, 4),
+                "Exp_class": ec, "Pred_class": pc,
+                "Class_match": ec == pc,
+                "Clinical": CLINICAL[name],
             })
         print()
 
-    # ── save ──────────────────────────────────────────────────────────────────
-    df = pd.DataFrame(all_rows)
-    fpath = os.path.join(args.output, 'results_famous_mutations.csv')
-    df.to_csv(fpath, index=False)
-    logging.info(f"\nSaved: {fpath}")
+    df = pd.DataFrame(rows)
+    out_csv = os.path.join(args.output, "results_famous_mutations.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"\nSaved: {out_csv}")
 
-    # ── summary ────────────────────────────────────────────────────────────────
-    df_obs = df[~df['Exp_ddG'].isna()]
-    acc = df_obs['Class_match'].mean()
-    print(f"\n{'='*60}")
-    print(f"Overall class accuracy: {acc:.1%} ({df_obs['Class_match'].sum()}/{len(df_obs)})")
-    print(f"\nPer-target class accuracy:")
+    obs = df[df["Exp_ddG"].notna()]
+    acc = obs["Class_match"].mean()
+    print(f"\nOverall class accuracy: {acc:.1%} "
+          f"({obs['Class_match'].sum()}/{len(obs)})")
+    print("\nPer-target class accuracy:")
     for t in TARGET_NAMES:
-        sub = df_obs[df_obs['Target']==t]
-        if len(sub) > 0:
-            a = sub['Class_match'].mean()
-            print(f"  {t:<10}: {a:.1%} ({sub['Class_match'].sum()}/{len(sub)})")
+        sub = obs[obs["Target"] == t]
+        if len(sub):
+            print(f"  {t:<10}: {sub['Class_match'].mean():.1%} "
+                  f"({sub['Class_match'].sum()}/{len(sub)})")
 
 
 if __name__ == "__main__":
