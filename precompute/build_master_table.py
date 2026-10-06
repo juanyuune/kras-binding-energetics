@@ -1,62 +1,33 @@
+#!/usr/bin/env python3
 """
-build_master_table.py  —  Phase 1, Step 1
-==========================================
-Builds the seven-output regression master table for KRAS PLM-MCNN.
+Build the master regression table for KRAS PLM-MCNN.
 
-For each of the 3,553 KRAS missense variants, produces one row with:
-  - Identity    : hgvs_pro, position, wt_aa, mutant_aa, mutant_sequence
-  - 7 targets   : ddG_fold, ddG_RAF1, ddG_PIK3CG, ddG_RALGDS,
-                  ddG_SOS1, ddG_K27, ddG_K55  (kcal/mol, continuous)
-  - 7 std       : std_fold, std_RAF1, ...      (experimental uncertainty)
-  - 7 masks     : mask_fold, mask_RAF1, ...    (1=observed, 0=missing)
-  - Fold status : folding_status               (Folding stable/destabilized/etc)
-  - Fold assign : partition                    (fold_0 to fold_4,
-                                                test_random, test_bio)
-  - Derived cls : class_fold, class_RAF1, ...  (for reference only)
+One row per variant (3,553 total), with:
+  - identity: variant, wt_aa, position, mutant_aa, mutant_sequence
+  - 7 ddG targets: fold, RAF1, PIK3CG, RALGDS, SOS1, K27, K55 (kcal/mol)
+  - 7 std columns: experimental uncertainty per target
+  - 7 mask columns: 1=observed, 0=missing (never imputed)
+  - partition: fold_0..fold_4, test_random, test_curated (position-exclusive)
 
-Design decisions (following professor's specification):
-  1. Missing values are NOT imputed — mask = 0 means excluded from loss
-  2. Sign convention: positive ddG = destabilising / weakening
-  3. Fold assignment loaded from existing FASTA split files
-     (position-exclusive, pre-registered before model training)
-  4. Folding ddG is the 7th regression target — NOT a filter criterion
+Sign convention: positive ddG = destabilising / binding weakened.
+Partition assignments are loaded from a pre-registered FASTA file —
+positions were assigned before any model training to prevent leakage.
 
-Output:
-  /KRAS/data/kras_master_table.csv   — full table (3,553 rows)
-  /KRAS/data/kras_master_table.json  — same, for easy inspection
-
-Run:
-  python build_master_table.py \
-    --xlsx   /srv/jupyterlab/workspace/KRAS/Weng_KRAS_Six_Partner_Mutant_Sequence_Dataset.xlsx \
-    --fasta  /srv/jupyterlab/workspace/KRAS/fasta/kras_all.fasta \
-    --outdir /srv/jupyterlab/workspace/KRAS/data/
+Usage:
+    python build_master_table.py \
+        --xlsx   data/Weng_KRAS_Six_Partner_Mutant_Sequence_Dataset.xlsx \
+        --fasta  data/kras_all.fasta \
+        --outdir data/
 """
 
 import os
 import argparse
-import logging
+
 import numpy as np
 import pandas as pd
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
 
-# ── args ──────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser()
-parser.add_argument("--xlsx",   required=True,
-                    help="Path to Weng_KRAS_Six_Partner_Mutant_Sequence_Dataset.xlsx")
-parser.add_argument("--fasta",  required=True,
-                    help="Path to kras_all.fasta (contains partition assignments)")
-parser.add_argument("--outdir", required=True,
-                    help="Output directory for master table CSV and JSON")
-args = parser.parse_args()
-
-os.makedirs(args.outdir, exist_ok=True)
-
-# ── sheet definitions ─────────────────────────────────────────────────────────
-PARTNER_SHEETS = {
+PARTNERS = {
     'RAF1':   'RAF1',
     'PIK3CG': 'PIK3CG',
     'RALGDS': 'RALGDS',
@@ -64,212 +35,126 @@ PARTNER_SHEETS = {
     'K27':    'DARPin K27',
     'K55':    'DARPin K55',
 }
+TARGETS = ['fold'] + list(PARTNERS.keys())
 
-TARGETS   = ['fold'] + list(PARTNER_SHEETS.keys())
-N_TARGETS = len(TARGETS)   # 7
 
-# ── Step 1: load folding ddG from RAF1 sheet (same across all sheets) ─────────
-logging.info("Loading folding ddG and variant identity from RAF1 sheet...")
-
-base = pd.read_excel(args.xlsx, sheet_name='RAF1')
-
-# keep only needed columns
-master = base[[
-    'hgvs_pro', 'wt_aa_1', 'position', 'mutant_aa_1', 'mutant_sequence',
-    'folding_ddG_kcal_mol', 'folding_std_kcal_mol', 'folding_status_d0.50',
-]].copy()
-
-master = master.rename(columns={
-    'hgvs_pro':              'variant',
-    'wt_aa_1':               'wt_aa',
-    'mutant_aa_1':           'mutant_aa',
-    'folding_ddG_kcal_mol':  'ddG_fold',
-    'folding_std_kcal_mol':  'std_fold',
-    'folding_status_d0.50':  'folding_status',
-})
-
-master['position'] = master['position'].astype(int)
-
-logging.info(f"  Base table: {len(master)} variants")
-
-# ── Step 2: add mask for folding ddG ─────────────────────────────────────────
-master['mask_fold'] = master['ddG_fold'].notna().astype(int)
-logging.info(f"  Folding ddG observed: {master['mask_fold'].sum()} / {len(master)}")
-
-# ── Step 3: add binding ddG per partner ───────────────────────────────────────
-logging.info("Loading binding ddG for each partner...")
-
-for partner_key, sheet_name in PARTNER_SHEETS.items():
-    logging.info(f"  Loading {partner_key} ({sheet_name})...")
-
-    df_p = pd.read_excel(args.xlsx, sheet_name=sheet_name)
-
-    # merge on hgvs_pro
-    df_p = df_p.rename(columns={'hgvs_pro': 'variant'})
-    df_p = df_p[['variant', 'ddG_kcal_mol', 'std_kcal_mol', 'class_4']].copy()
-    df_p = df_p.rename(columns={
-        'ddG_kcal_mol': f'ddG_{partner_key}',
-        'std_kcal_mol': f'std_{partner_key}',
-        'class_4':      f'class_{partner_key}',
-    })
-
-    master = master.merge(df_p, on='variant', how='left')
-
-    # mask: 1 if ddG observed (not NaN)
-    master[f'mask_{partner_key}'] = master[f'ddG_{partner_key}'].notna().astype(int)
-    obs = master[f'mask_{partner_key}'].sum()
-    logging.info(f"    {partner_key}: {obs} / {len(master)} observed")
-
-# ── Step 4: load partition assignments from FASTA ────────────────────────────
-logging.info("Loading partition assignments from FASTA...")
-
-def parse_partition_map(fasta_path):
-    """Returns {variant_name: partition_string}"""
-    part_map = {}
-    with open(fasta_path, 'r') as f:
+def parse_fasta_partitions(fasta_path):
+    """Read partition assignments from FASTA headers (key=value fields)."""
+    parts = {}
+    with open(fasta_path) as f:
         for line in f:
             if not line.startswith('>'):
                 continue
-            header = line.strip().lstrip('>')
-            parts  = header.split('|')
-            fields = {'variant': parts[0]}
-            for p in parts[1:]:
-                if '=' in p:
-                    k, v = p.split('=', 1)
+            fields = {}
+            for tok in line.strip().lstrip('>').split('|'):
+                if '=' in tok:
+                    k, v = tok.split('=', 1)
                     fields[k] = v
-            var  = fields.get('variant', '')
-            part = fields.get('partition', 'unknown')
-            if var and var not in part_map:
-                part_map[var] = part
-    return part_map
+                else:
+                    fields['variant'] = tok
+            var = fields.get('variant', '')
+            if var and var not in parts:
+                parts[var] = fields.get('partition', 'unknown')
+    return parts
 
-part_map = parse_partition_map(args.fasta)
-logging.info(f"  Loaded {len(part_map)} partition assignments")
 
-master['partition'] = master['variant'].map(part_map)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--xlsx',   required=True)
+    parser.add_argument('--fasta',  required=True)
+    parser.add_argument('--outdir', required=True)
+    args = parser.parse_args()
 
-# check for unmapped variants
-unmapped = master['partition'].isna().sum()
-if unmapped > 0:
-    logging.warning(f"  {unmapped} variants not found in FASTA — "
-                    f"partition set to 'unknown'")
-    master['partition'] = master['partition'].fillna('unknown')
+    os.makedirs(args.outdir, exist_ok=True)
 
-# partition distribution
-logging.info("  Partition distribution:")
-for part, count in master['partition'].value_counts().items():
-    logging.info(f"    {part:<15}: {count}")
+    # load folding ddG and variant identity from RAF1 sheet
+    print('loading folding ddG from RAF1 sheet...')
+    base = pd.read_excel(args.xlsx, sheet_name='RAF1')
+    master = base[[
+        'hgvs_pro', 'wt_aa_1', 'position', 'mutant_aa_1', 'mutant_sequence',
+        'folding_ddG_kcal_mol', 'folding_std_kcal_mol', 'folding_status_d0.50',
+    ]].copy().rename(columns={
+        'hgvs_pro':             'variant',
+        'wt_aa_1':              'wt_aa',
+        'mutant_aa_1':          'mutant_aa',
+        'folding_ddG_kcal_mol': 'ddG_fold',
+        'folding_std_kcal_mol': 'std_fold',
+        'folding_status_d0.50': 'folding_status',
+    })
+    master['position']  = master['position'].astype(int)
+    master['mask_fold'] = master['ddG_fold'].notna().astype(int)
+    print(f'  {len(master)} variants  fold observed: {master["mask_fold"].sum()}')
 
-# ── Step 5: compute summary columns ──────────────────────────────────────────
-logging.info("Computing summary columns...")
+    # merge binding ddG per partner
+    for key, sheet in PARTNERS.items():
+        print(f'  loading {key} ({sheet})...')
+        df = pd.read_excel(args.xlsx, sheet_name=sheet)
+        df = df.rename(columns={
+            'hgvs_pro':     'variant',
+            'ddG_kcal_mol': f'ddG_{key}',
+            'std_kcal_mol': f'std_{key}',
+            'class_4':      f'class_{key}',
+        })[['variant', f'ddG_{key}', f'std_{key}', f'class_{key}']]
+        master = master.merge(df, on='variant', how='left')
+        master[f'mask_{key}'] = master[f'ddG_{key}'].notna().astype(int)
+        print(f'    {master[f"mask_{key}"].sum()} / {len(master)} observed')
 
-ddg_cols  = [f'ddG_{t}'  for t in TARGETS]
-std_cols  = [f'std_{t}'  for t in TARGETS]
-mask_cols = [f'mask_{t}' for t in TARGETS]
+    # partition assignments from pre-registered FASTA
+    print(f'\nloading partitions from {args.fasta}...')
+    part_map = parse_fasta_partitions(args.fasta)
+    master['partition'] = master['variant'].map(part_map).fillna('unknown')
+    print(master['partition'].value_counts().to_string())
 
-# number of observed targets per variant
-master['n_observed'] = master[mask_cols].sum(axis=1)
+    # summary columns
+    mask_cols      = [f'mask_{t}' for t in TARGETS]
+    bind_ddg_cols  = [f'ddG_{p}'  for p in PARTNERS]
+    bind_mask_cols = [f'mask_{p}' for p in PARTNERS]
 
-# mean ddG across observed binding partners (not fold)
-bind_ddg_cols  = [f'ddG_{p}'  for p in PARTNER_SHEETS]
-bind_mask_cols = [f'mask_{p}' for p in PARTNER_SHEETS]
+    master['n_observed'] = master[mask_cols].sum(1)
+    master['mean_ddG_binding'] = master.apply(
+        lambda r: float(np.mean([r[v] for v, m in zip(bind_ddg_cols, bind_mask_cols)
+                                 if r[m] == 1])) if r[bind_mask_cols].sum() > 0 else np.nan,
+        axis=1,
+    )
+    master['is_folding_stable'] = (master['folding_status'] == 'Folding stable').astype(int)
 
-def masked_mean(row, val_cols, mask_cols):
-    vals  = [row[v] for v, m in zip(val_cols, mask_cols) if row[m] == 1]
-    return float(np.mean(vals)) if vals else np.nan
+    # column order
+    cols = (['variant', 'wt_aa', 'position', 'mutant_aa', 'mutant_sequence',
+              'partition', 'folding_status', 'is_folding_stable',
+              'n_observed', 'mean_ddG_binding'] +
+            [f'ddG_{t}'   for t in TARGETS] +
+            [f'std_{t}'   for t in TARGETS] +
+            [f'mask_{t}'  for t in TARGETS] +
+            [f'class_{p}' for p in PARTNERS])
+    master = master[[c for c in cols if c in master.columns]]
 
-master['mean_ddG_binding'] = master.apply(
-    lambda r: masked_mean(r, bind_ddg_cols, bind_mask_cols), axis=1
-)
+    # save
+    csv_path  = os.path.join(args.outdir, 'kras_master_table.csv')
+    json_path = os.path.join(args.outdir, 'kras_master_table.json')
+    master.to_csv(csv_path, index=False)
+    master.to_json(json_path, orient='records', indent=2)
+    print(f'\nsaved: {csv_path}  ({master.shape[0]} rows x {master.shape[1]} cols)')
+    print(f'saved: {json_path}')
 
-# ── Step 6: derive impact class from folding ──────────────────────────────────
-# Folding stable = folding_ddG ≤ 0.50 kcal/mol (professor's d0.50 threshold)
-# This is used for the folding-conditioned model analysis
-master['is_folding_stable'] = (
-    master['folding_status'] == 'Folding stable'
-).astype(int)
-
-# ── Step 7: final column order ────────────────────────────────────────────────
-col_order = (
-    ['variant', 'wt_aa', 'position', 'mutant_aa', 'mutant_sequence']
-    + ['partition', 'folding_status', 'is_folding_stable']
-    + ['n_observed', 'mean_ddG_binding']
-    # targets
-    + [f'ddG_{t}'  for t in TARGETS]
-    # standard deviations
-    + [f'std_{t}'  for t in TARGETS]
-    # masks
-    + [f'mask_{t}' for t in TARGETS]
-    # derived binding classes (for reference)
-    + [f'class_{p}' for p in PARTNER_SHEETS]
-)
-# only keep columns that exist
-col_order = [c for c in col_order if c in master.columns]
-master = master[col_order]
-
-# ── Step 8: save ──────────────────────────────────────────────────────────────
-csv_path  = os.path.join(args.outdir, 'kras_master_table.csv')
-json_path = os.path.join(args.outdir, 'kras_master_table.json')
-
-master.to_csv(csv_path,  index=False)
-master.to_json(json_path, orient='records', indent=2)
-
-logging.info(f"\nSaved: {csv_path}")
-logging.info(f"Saved: {json_path}")
-
-# ── Step 9: verification printout ─────────────────────────────────────────────
-print("\n" + "=" * 65)
-print("MASTER TABLE VERIFICATION")
-print("=" * 65)
-
-print(f"\nShape: {master.shape}  ({master.shape[0]} variants × {master.shape[1]} columns)")
-
-print(f"\n--- TARGET COVERAGE ---")
-print(f"{'Target':<12} {'Observed':>10} {'Missing':>8} {'%':>8}")
-print("-" * 42)
-for t in TARGETS:
-    obs     = master[f'mask_{t}'].sum()
-    missing = len(master) - obs
-    pct     = 100 * obs / len(master)
-    print(f"  {t:<10} {obs:>10} {missing:>8} {pct:>7.1f}%")
-
-print(f"\n--- VARIANTS BY N_OBSERVED ---")
-for n in sorted(master['n_observed'].unique(), reverse=True):
-    count = (master['n_observed'] == n).sum()
-    print(f"  n_observed={n}: {count:4d} variants")
-
-print(f"\n--- PARTITION DISTRIBUTION ---")
-print(f"{'Partition':<15} {'N':>6} {'%':>8}")
-print("-" * 32)
-for part, count in master['partition'].value_counts().items():
-    pct = 100 * count / len(master)
-    print(f"  {part:<15} {count:>6} {pct:>7.1f}%")
-
-print(f"\n--- FOLDING STATUS ---")
-for status, count in master['folding_status'].value_counts().items():
-    print(f"  {status:<30}: {count:4d}")
-
-print(f"\n--- ddG RANGES (observed values) ---")
-for t in TARGETS:
-    col   = f'ddG_{t}'
-    obs   = master[col].dropna()
-    print(f"  {t:<10}: min={obs.min():+.3f}  "
-          f"max={obs.max():+.3f}  "
-          f"mean={obs.mean():+.3f}  "
-          f"std={obs.std():.3f}")
-
-print(f"\n--- SAMPLE ROW (G12D) ---")
-g12d = master[master['variant'] == 'p.Gly12Asp']
-if len(g12d):
-    row = g12d.iloc[0]
-    print(f"  variant   : {row['variant']}")
-    print(f"  partition : {row['partition']}")
+    # verification
+    print('\ncoverage per target:')
     for t in TARGETS:
-        obs = row[f'mask_{t}']
-        val = row[f'ddG_{t}']
-        val_str = f"{val:+.4f}" if pd.notna(val) else "   NaN"
-        print(f"  ddG_{t:<8}: {val_str}  mask={int(obs)}")
+        obs = master[f'mask_{t}'].sum()
+        print(f'  {t:<10}: {obs}/{len(master)} ({100*obs/len(master):.1f}%)')
 
-print(f"\n{'='*65}")
-print(f"Master table complete. Output: {args.outdir}")
-print(f"{'='*65}")
+    print('\nddG ranges:')
+    for t in TARGETS:
+        v = master[f'ddG_{t}'].dropna()
+        print(f'  {t:<10}: [{v.min():+.3f}, {v.max():+.3f}]  mean={v.mean():+.3f}')
+
+    g12d = master[master['variant'] == 'p.Gly12Asp']
+    if len(g12d):
+        row = g12d.iloc[0]
+        print(f'\nG12D check: partition={row["partition"]}')
+        for t in TARGETS:
+            v = row[f'ddG_{t}']
+            print(f'  ddG_{t:<8}: {v:+.4f}' if pd.notna(v) else f'  ddG_{t:<8}: NaN')
+
+
+if __name__ == '__main__':
+    main()
