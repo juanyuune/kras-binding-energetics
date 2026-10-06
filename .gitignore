@@ -1,0 +1,29 @@
+# Large data files
+tensors/
+data/kras_master_table.csv
+data/kras_master_table.json
+data/*.csv
+data/*.json
+dataset/
+emb/
+fasta/
+backup/
+
+# Model checkpoints
+results/*.pt
+results/*.npy
+results/*.csv
+results/*.log
+results/*.png
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+*.ipynb
+
+# Python
+__pycache__/
+*.pyc
+
+# System
+.DS_Store
